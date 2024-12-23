@@ -1,0 +1,366 @@
+import psycopg2
+import telebot
+import bcrypt
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+import pandas as pd
+from tabulate import tabulate
+# Замените на ваш токен
+API_TOKEN = '8004813663:AAEIGYOB-mZGhxZsggIPvIiJ8FUfUoRgFdw'
+
+# Параметры подключения к базе данных
+DB_CONFIG = {
+    'dbname': 'library_bot',
+    'user': 'amina',
+    'password': '_auMW{\zp.,+wS<=_4k7uNgE)gr_Jp',
+    'host': 'localhost',
+    'port': '5432'
+}
+
+
+bot = telebot.TeleBot(API_TOKEN)
+
+
+# Функции для работы с паролями
+def hash_password(password):
+    """Хэширование пароля с использованием bcrypt."""
+    salt = bcrypt.gensalt()  # Генерация соли
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)  # Хэширование пароля
+    return hashed.decode('utf-8')
+
+
+def verify_password(password, hashed_password):
+    """Проверка введенного пароля на соответствие хэшированному."""
+    return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+
+# Главное меню администратора с эмодзи
+def get_admin_menu():
+    """Создание меню для администраторов."""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("📚 Добавить книгу"))
+    markup.add(KeyboardButton("❌ Удаление книги"))
+    markup.add(KeyboardButton("📊 Генерация отчета"))
+    return markup
+
+
+# Функция для получения книг из базы данных
+def get_books_from_db():
+    """Получение списка книг из базы данных."""
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cursor:
+                query = "SELECT id, title FROM books;"
+                cursor.execute(query)
+                books = cursor.fetchall()
+                return books
+    except Exception as e:
+        print(f"Ошибка подключения к базе данных: {e}")
+        return []
+
+
+# Функция для создания инлайн клавиатуры с книгами
+def create_books_markup():
+    """Создание инлайн клавиатуры для списка книг."""
+    books = get_books_from_db()
+    markup = InlineKeyboardMarkup(row_width=2)
+    if books:
+        for book in books:
+            markup.add(InlineKeyboardButton(book[1], callback_data=f"delete_{book[0]}"))
+    return markup
+
+
+# Функция для получения жанров из базы данных
+def get_genres_from_db():
+    """Получение уникальных жанров книг из базы данных."""
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cursor:
+                query = "SELECT DISTINCT genre FROM books WHERE genre IS NOT NULL;"
+                cursor.execute(query)
+                genres = cursor.fetchall()
+                return [genre[0] for genre in genres]
+    except Exception as e:
+        print(f"Ошибка подключения к базе данных: {e}")
+        return []
+
+
+# Функция для создания инлайн клавиатуры с жанрами
+def create_genre_markup():
+    """Создание инлайн клавиатуры для жанров."""
+    genres = get_genres_from_db()
+    markup = InlineKeyboardMarkup(row_width=2)
+    if genres:
+        for genre in genres:
+            markup.add(InlineKeyboardButton(genre, callback_data=genre))
+    markup.add(InlineKeyboardButton("➕ Добавить новый жанр", callback_data="new_genre"))
+    return markup
+
+
+# Обработчик команды /start
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    """Обработчик команды /start для начала работы с ботом."""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if is_admin(user_id):
+        bot.send_message(chat_id, "👋 Добро пожаловать, администратор! Выберите действие из меню:",
+                         reply_markup=get_admin_menu())
+    else:
+        bot.send_message(chat_id,
+                         "🚫 У вас нет доступа к этому боту. Пожалуйста, введите ваш Telegram ID, чтобы проверить доступ.")
+        bot.register_next_step_handler(message, check_access)
+
+
+# Проверка роли администратора в базе данных
+def is_admin(telegram_id):
+    """Проверка, является ли пользователь администратором."""
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cursor:
+                query = "SELECT role FROM admins WHERE telegram_id = %s;"
+                cursor.execute(query, (str(telegram_id),))
+                result = cursor.fetchone()
+                return result is not None and result[0] == 'администратор'
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return False
+
+
+# Регистрация пользователя
+@bot.message_handler(commands=['register'])
+def register_user(message):
+    """Обработчик команды для регистрации пользователя."""
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "Введите ваш email:")
+    bot.register_next_step_handler(message, process_user_email)
+
+
+def process_user_email(message):
+    """Обработка введенного email."""
+    email = message.text.strip()
+    if "@" not in email:
+        bot.send_message(message.chat.id, "❗ Некорректный email. Попробуйте снова.")
+        bot.register_next_step_handler(message, process_user_email)
+        return
+
+    bot.send_message(message.chat.id, "Введите ваш пароль (не менее 8 символов):")
+    bot.register_next_step_handler(message, process_user_password, email)
+
+
+def process_user_password(message, email):
+    """Обработка введенного пароля и создание хэша пароля."""
+    password = message.text.strip()
+    if len(password) < 8:
+        bot.send_message(message.chat.id, "❗ Пароль должен быть не менее 8 символов. Попробуйте снова.")
+        bot.register_next_step_handler(message, process_user_password, email)
+        return
+
+    hashed_password = hash_password(password)  # Хэширование пароля
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cursor:
+                query = """
+                INSERT INTO users (telegram_id, email, password_hash, name, surname, role)
+                VALUES (%s, %s, %s, 'Имя', 'Фамилия', 'ученик')
+                """
+                cursor.execute(query, (message.chat.id, email, hashed_password))
+                conn.commit()
+                bot.send_message(message.chat.id, "✅ Регистрация прошла успешно!")
+    except Exception as e:
+        bot.send_message(message.chat.id, "❌ Ошибка при регистрации.")
+        print(f"Ошибка базы данных: {e}")
+
+
+# Обработчик кнопки "Добавить книгу"
+@bot.message_handler(func=lambda message: message.text == "📚 Добавить книгу")
+def add_book(message):
+    """Обработчик добавления книги."""
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "🔍 Выберите жанр книги:", reply_markup=create_genre_markup())
+
+
+# Обработчик нажатия на инлайн кнопку для жанра или удаления книги
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback_query(call):
+    """Обработчик нажатий на инлайн кнопки."""
+    if call.data.startswith("delete_"):
+        book_id = call.data.split("delete_")[1]
+        chat_id = call.message.chat.id
+        try:
+            with psycopg2.connect(**DB_CONFIG) as conn:
+                with conn.cursor() as cursor:
+                    query = "DELETE FROM books WHERE id = %s;"
+                    cursor.execute(query, (book_id,))
+                    conn.commit()
+                    bot.send_message(chat_id, f"✅ Книга с ID {book_id} успешно удалена!")
+        except Exception as e:
+            bot.send_message(chat_id, "❌ Ошибка при удалении книги.")
+            print(f"Ошибка базы данных: {e}")
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=create_books_markup())
+    elif call.data == "new_genre":
+        chat_id = call.message.chat.id
+        bot.send_message(chat_id, "✍ Введите название нового жанра:")
+        bot.register_next_step_handler(call.message, process_new_genre)
+    else:
+        genre = call.data
+        chat_id = call.message.chat.id
+        bot.send_message(chat_id, f"📖 Вы выбрали жанр: {genre}. Введите название книги:")
+        bot.register_next_step_handler(call.message, process_book_title, genre)
+    bot.answer_callback_query(call.id)
+
+
+# Обработка ввода нового жанра
+def process_new_genre(message):
+    """Обработка добавления нового жанра."""
+    genre = message.text.strip()
+    chat_id = message.chat.id
+
+    if not genre:
+        bot.send_message(chat_id, "❗ Название жанра не может быть пустым. Пожалуйста, попробуйте снова.")
+        bot.register_next_step_handler(message, process_new_genre)
+        return
+
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM books WHERE genre = %s;", (genre,))
+                count = cursor.fetchone()[0]
+
+                if count > 0:
+                    bot.send_message(chat_id, f"⚠ Жанр '{genre}' уже существует.")
+                else:
+                    cursor.execute("UPDATE books SET genre = %s WHERE genre IS NULL;", (genre,))
+                    conn.commit()
+                    bot.send_message(chat_id, f"✅ Жанр '{genre}' успешно добавлен!")
+
+        # После добавления жанра продолжаем процесс добавления книги
+        bot.send_message(chat_id, f"📖 Вы выбрали жанр: {genre}. Введите название книги:")
+        bot.register_next_step_handler(message, process_book_title, genre)
+
+    except Exception as e:
+        bot.send_message(chat_id, "❌ Ошибка при добавлении жанра.")
+        print(f"Ошибка базы данных: {e}")
+
+
+# Обработка ввода названия книги
+def process_book_title(message, genre):
+    """Обработка ввода названия книги."""
+    title = message.text.strip()
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "🖋 Введите автора книги:")
+    bot.register_next_step_handler(message, process_book_author, genre, title)
+
+
+# Обработка введенного автора
+def process_book_author(message, genre, title):
+    """Обработка ввода автора книги."""
+    author = message.text.strip()
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "📜 Введите описание книги:")
+    bot.register_next_step_handler(message, process_book_description, genre, title, author)
+
+
+# Обработка введенного описания книги
+def process_book_description(message, genre, title, author):
+    """Обработка ввода описания книги."""
+    description = message.text.strip()
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "📊 Введите количество копий книги:")
+    bot.register_next_step_handler(message, process_book_copies, genre, title, author, description)
+
+
+# Обработка ввода количества копий с проверкой
+def process_book_copies(message, genre, title, author, description):
+    """Обработка ввода количества копий книги."""
+    chat_id = message.chat.id
+    try:
+        total_copies = int(message.text.strip())
+        if total_copies < 1:
+            raise ValueError("Количество копий должно быть положительным числом.")
+
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cursor:
+                # Добавление книги в таблицу books
+                query_books = """
+                INSERT INTO books (title, author, genre, description)
+                VALUES (%s, %s, %s, %s) RETURNING id;
+                """
+                cursor.execute(query_books, (title, author, genre, description))
+                book_id = cursor.fetchone()[0]  # Получаем ID добавленной книги
+
+                # Добавление информации о копиях в таблицу book_inventory
+                query_inventory = """
+                INSERT INTO book_inventory (book_id, total_copies, available_copies)
+                VALUES (%s, %s, %s);
+                """
+                cursor.execute(query_inventory, (book_id, total_copies, total_copies))
+
+                conn.commit()
+                bot.send_message(chat_id, "✅ Книга успешно добавлена в базу данных!")
+
+        bot.send_message(chat_id, "🔧 Выберите следующее действие:", reply_markup=get_admin_menu())
+
+    except ValueError:
+        bot.send_message(chat_id, "❗ Пожалуйста, введите корректное количество копий.")
+        bot.register_next_step_handler(message, process_book_copies, genre, title, author, description)
+    except Exception as e:
+        bot.send_message(chat_id, "❌ Ошибка при добавлении книги.")
+        print(f"Ошибка базы данных: {e}")
+        bot.send_message(chat_id, "🔧 Выберите следующее действие:", reply_markup=get_admin_menu())
+
+
+# Обработчик кнопки "Удаление книги"
+@bot.message_handler(func=lambda message: message.text == "❌ Удаление книги")
+def delete_book(message):
+    """Обработчик удаления книги."""
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "🔍 Выберите книгу для удаления:", reply_markup=create_books_markup())
+
+
+# Обработчик кнопки "Генерация отчета"
+@bot.message_handler(func=lambda message: message.text == "📊 Генерация отчета")
+def generate_report(message):
+    """Обработчик генерации отчета по книгам."""
+    chat_id = message.chat.id
+    try:
+        books = get_books_from_db()
+        if books:
+            # Преобразуем данные в формат таблицы
+            df = pd.DataFrame(books, columns=["ID", "Title"])
+            # Преобразуем DataFrame в строку с использованием tabulate для лучшего формата
+            report = tabulate(df, headers='keys', tablefmt='grid', showindex=False)
+            bot.send_message(chat_id, f"📑 Отчет по книгам:\n{report}")
+        else:
+            bot.send_message(chat_id, "❌ Нет доступных книг для отчета.")
+    except Exception as e:
+        bot.send_message(chat_id, "❌ Ошибка при генерации отчета.")
+        print(f"Ошибка при получении данных для отчета: {e}")
+
+
+# Проверка доступа пользователя
+def check_access(message):
+    """Проверка доступа пользователя по введенному Telegram ID."""
+    chat_id = message.chat.id
+    telegram_id = message.text.strip()
+    if is_admin(telegram_id):
+        bot.send_message(
+            chat_id,
+            "✅ Доступ разрешен! Выберите действие из меню:",
+            reply_markup=get_admin_menu()
+        )
+    else:
+        bot.send_message(chat_id, "❌ У вас нет доступа к этому боту.")
+
+
+# Обработчик неизвестных команд
+@bot.message_handler(func=lambda message: True)
+def handle_unknown_command(message):
+    """Обработчик неизвестных команд."""
+    chat_id = message.chat.id
+    bot.send_message(chat_id,
+                     "❓ Я не понимаю эту команду. Пожалуйста, выберите одну из доступных команд или напишите мне!")
+
+
+if __name__ == '__main__':
+    bot.polling(none_stop=True)
